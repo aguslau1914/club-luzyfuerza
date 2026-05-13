@@ -7,6 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Archivo:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
   :root {
     --bg: #0a0c0b;
@@ -1584,25 +1585,166 @@ async function _storageDelete(key) {
   try { localStorage.removeItem(key); } catch (e) {}
 }
 
-let lastSaveStatus = null; // 'ok' | 'failed' | null
+// ----- Supabase Sync Layer -----
+const SUPABASE_CONFIG_KEY = 'club_supabase_config';
+const SYNC_ROW_ID = 'main';
+
+let supabaseClient = null;
+let realtimeChannel = null;
+let lastCloudPushAt = 0;
+let isApplyingRemote = false;
+
+function getSupabaseConfig() {
+  try {
+    const raw = localStorage.getItem(SUPABASE_CONFIG_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
+function setSupabaseConfig(cfg) {
+  try {
+    localStorage.setItem(SUPABASE_CONFIG_KEY, JSON.stringify(cfg));
+    return true;
+  } catch { return false; }
+}
+
+function clearSupabaseConfig() {
+  try { localStorage.removeItem(SUPABASE_CONFIG_KEY); } catch {}
+}
+
+async function initCloudSync() {
+  const cfg = getSupabaseConfig();
+  if (!cfg || !cfg.url || !cfg.anonKey || !window.supabase) return false;
+  try {
+    supabaseClient = window.supabase.createClient(cfg.url, cfg.anonKey);
+    // Pull latest from cloud
+    const cloudState = await fetchCloudData();
+    if (cloudState) {
+      isApplyingRemote = true;
+      state = { ...state, ...cloudState };
+      applyDefaults();
+      isApplyingRemote = false;
+      // Also cache locally
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch {}
+      render();
+    } else {
+      // Cloud is empty → push our local data up
+      await pushCloudData();
+    }
+    setupRealtimeChannel();
+    return true;
+  } catch (e) {
+    console.error('Cloud sync init failed:', e);
+    supabaseClient = null;
+    return false;
+  }
+}
+
+async function fetchCloudData() {
+  if (!supabaseClient) return null;
+  try {
+    const { data, error } = await supabaseClient
+      .from('club_data')
+      .select('data')
+      .eq('id', SYNC_ROW_ID)
+      .maybeSingle();
+    if (error) {
+      console.warn('Cloud fetch error:', error);
+      return null;
+    }
+    return data?.data || null;
+  } catch (e) {
+    console.warn('Cloud fetch threw:', e);
+    return null;
+  }
+}
+
+async function pushCloudData() {
+  if (!supabaseClient) return false;
+  try {
+    const { error } = await supabaseClient
+      .from('club_data')
+      .upsert({
+        id: SYNC_ROW_ID,
+        data: state,
+        updated_at: new Date().toISOString(),
+      });
+    if (error) throw error;
+    lastCloudPushAt = Date.now();
+    return true;
+  } catch (e) {
+    console.error('Cloud push failed:', e);
+    return false;
+  }
+}
+
+function setupRealtimeChannel() {
+  if (!supabaseClient) return;
+  if (realtimeChannel) {
+    try { supabaseClient.removeChannel(realtimeChannel); } catch {}
+    realtimeChannel = null;
+  }
+  realtimeChannel = supabaseClient
+    .channel('club_data_changes')
+    .on(
+      'postgres_changes',
+      { event: '*', schema: 'public', table: 'club_data', filter: `id=eq.${SYNC_ROW_ID}` },
+      (payload) => {
+        if (!payload.new || !payload.new.data) return;
+        // Ignore our own writes (within 3s window)
+        if (Date.now() - lastCloudPushAt < 3000) return;
+        const incoming = payload.new.data;
+        const incomingJSON = JSON.stringify(incoming);
+        const currentJSON = JSON.stringify(state);
+        if (incomingJSON === currentJSON) return;
+        // Apply remote change
+        isApplyingRemote = true;
+        state = { ...state, ...incoming };
+        applyDefaults();
+        isApplyingRemote = false;
+        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch {}
+        // Only re-render if no sheet open (don't disrupt editing)
+        if (!$('#sheet-overlay')) {
+          render();
+          toast('🔄 Actualizado desde otro celular');
+        }
+      }
+    )
+    .subscribe();
+}
+
+function disconnectCloudSync() {
+  if (realtimeChannel && supabaseClient) {
+    try { supabaseClient.removeChannel(realtimeChannel); } catch {}
+  }
+  realtimeChannel = null;
+  supabaseClient = null;
+  clearSupabaseConfig();
+}
+
+let lastSaveStatus = null; // 'ok' | 'failed' | 'cloud_failed'
 
 async function saveState() {
+  // Don't save if we're applying a remote update (avoid echo loop)
+  if (isApplyingRemote) return true;
+
   const json = JSON.stringify(state);
+  // Always save local cache first (fast, offline-friendly)
   const ok = await _storageSet(STORAGE_KEY, json);
   if (!ok) {
     lastSaveStatus = 'failed';
-    toast('⚠️ Falló el guardado. Exportá un backup YA.');
+    toast('⚠️ Falló el guardado local. Exportá un backup YA.');
     return false;
   }
-  // Verify it actually persisted
-  try {
-    const back = await _storageGet(STORAGE_KEY);
-    if (!back) {
-      lastSaveStatus = 'failed';
-      toast('⚠️ El guardado no se verificó.');
+  // Push to cloud if connected
+  if (supabaseClient) {
+    const cloudOk = await pushCloudData();
+    if (!cloudOk) {
+      lastSaveStatus = 'cloud_failed';
+      toast('☁️ Guardado local OK, pero falló sync con la nube');
       return false;
     }
-  } catch (e) {}
+  }
   lastSaveStatus = 'ok';
   return true;
 }
@@ -3620,6 +3762,13 @@ function renderMoreView() {
             </div>
           </div>
         ` : ''}
+        <div class="action-row" id="sync-settings">
+          <div class="action-icon">☁️</div>
+          <div class="action-text">
+            <div class="action-title">Sincronización entre celulares</div>
+            <div class="action-desc">${supabaseClient ? '✓ Conectado a la nube · Cambios se sincronizan automáticamente' : 'Configurar Supabase para compartir datos'}</div>
+          </div>
+        </div>
         <div class="action-row" id="export-data">
           <div class="action-icon">📤</div>
           <div class="action-text">
@@ -3709,6 +3858,7 @@ document.addEventListener('click', (e) => {
   if (e.target.closest('#manage-cats')) { openCategoryManage(); return; }
   if (e.target.closest('#change-pwd')) { openChangePassword(); return; }
   if (e.target.closest('#logout')) { doLogout(); return; }
+  if (e.target.closest('#sync-settings')) { openSyncSettings(); return; }
   if (e.target.closest('#export-data')) { exportData(); return; }
   if (e.target.closest('#import-data')) { importData(); return; }
   if (e.target.closest('#reset-data')) { resetData(); return; }
@@ -3789,6 +3939,170 @@ function doLogout() {
   if (!confirm('¿Cerrar sesión? Te va a pedir la clave para volver.')) return;
   isAuthenticated = false;
   render();
+}
+
+function openSyncSettings() {
+  const cfg = getSupabaseConfig();
+  const isConnected = !!supabaseClient;
+  const isConfigured = !!cfg;
+
+  openSheet({
+    title: 'Sincronización en la nube',
+    body: `
+      ${isConnected ? `
+        <div class="alert-row" style="background:rgba(74,222,128,0.1);border-color:rgba(74,222,128,0.25);color:var(--success);">
+          ✅ Conectado a Supabase. Tus cambios se sincronizan al toque con todos los celulares que tengan estas mismas credenciales.
+        </div>
+        <div class="form-group">
+          <label class="form-label">URL del proyecto</label>
+          <div class="form-input-readonly" style="font-size:11px;font-family:'JetBrains Mono',monospace;overflow:hidden;text-overflow:ellipsis;">${escapeHTML(cfg.url)}</div>
+        </div>
+        <div class="action-list">
+          <div class="action-row" id="sync-share-creds">
+            <div class="action-icon">📤</div>
+            <div class="action-text">
+              <div class="action-title">Compartir con otro celular</div>
+              <div class="action-desc">Copia las credenciales para mandar por WhatsApp</div>
+            </div>
+          </div>
+          <div class="action-row" id="sync-pull">
+            <div class="action-icon">🔄</div>
+            <div class="action-text">
+              <div class="action-title">Refrescar desde la nube</div>
+              <div class="action-desc">Forzar la sincronización ahora</div>
+            </div>
+          </div>
+          <div class="action-row" id="sync-disconnect">
+            <div class="action-icon" style="color:var(--danger);">🔌</div>
+            <div class="action-text">
+              <div class="action-title" style="color:var(--danger);">Desconectar sincronización</div>
+              <div class="action-desc">Volver a usar solo este celular</div>
+            </div>
+          </div>
+        </div>
+      ` : `
+        <div class="alert-row" style="background:rgba(93,211,255,0.1);border-color:rgba(93,211,255,0.25);color:var(--info);">
+          ℹ️ Conectá tu base Supabase para que todos los celulares (DT, ayudante, presi) compartan el mismo plantel en tiempo real.
+        </div>
+        <div class="form-group">
+          <label class="form-label">URL del proyecto Supabase</label>
+          <input id="sync-url" class="form-input" placeholder="https://xxxxx.supabase.co" type="url" value="${cfg?.url || ''}">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Anon Key (clave pública)</label>
+          <textarea id="sync-key" class="form-textarea" placeholder="eyJhbGciOi..." rows="4">${cfg?.anonKey || ''}</textarea>
+        </div>
+        <details style="margin-top:12px;">
+          <summary>📖 Cómo configurar Supabase (primera vez)</summary>
+          <ol style="color:var(--text-dim);font-size:12px;padding-left:20px;line-height:1.6;">
+            <li>Creá cuenta gratis en <b>supabase.com</b></li>
+            <li>Click en <b>"New Project"</b>, elegí nombre y contraseña</li>
+            <li>Esperá ~2 min que se cree</li>
+            <li>Andá a <b>SQL Editor</b> (icono &lt;&gt; izquierda) → <b>New query</b></li>
+            <li>Pegá el SQL que te paso por chat y ejecutalo (botón "Run")</li>
+            <li>Andá a <b>Settings → API</b> (engranaje izquierda)</li>
+            <li>Copiá <b>Project URL</b> y <b>anon public</b> key, pegalos arriba</li>
+            <li>Tocá "Conectar" abajo</li>
+          </ol>
+        </details>
+      `}
+    `,
+    footer: isConnected ? `
+      <button class="btn btn-primary btn-full" onclick="closeSheet()">Cerrar</button>
+    ` : `
+      <button class="btn btn-ghost flex-1" onclick="closeSheet()">Cancelar</button>
+      <button id="sync-connect" class="btn btn-primary flex-1">Conectar</button>
+    `,
+  });
+
+  if (!isConnected) {
+    $('#sync-connect').onclick = async () => {
+      const url = $('#sync-url').value.trim().replace(/\/+$/, '');
+      const anonKey = $('#sync-key').value.trim();
+      if (!url || !anonKey) { toast('Faltan URL o Anon Key'); return; }
+      if (!url.startsWith('http')) { toast('La URL tiene que empezar con https://'); return; }
+      if (!window.supabase) { toast('No se cargó la librería de Supabase. Revisá tu conexión.'); return; }
+
+      // Test connection
+      $('#sync-connect').textContent = 'Conectando...';
+      $('#sync-connect').disabled = true;
+      try {
+        const testClient = window.supabase.createClient(url, anonKey);
+        const { error } = await testClient.from('club_data').select('id').limit(1);
+        // Error codes: PGRST116 = no rows, PGRST301 = empty, both OK
+        if (error && error.code && !['PGRST116', 'PGRST301'].includes(error.code)) {
+          toast('Conexión fallida: ' + (error.message || error.code).slice(0, 50));
+          $('#sync-connect').textContent = 'Conectar';
+          $('#sync-connect').disabled = false;
+          return;
+        }
+      } catch (e) {
+        toast('No se pudo conectar: ' + (e.message || 'error').slice(0, 50));
+        $('#sync-connect').textContent = 'Conectar';
+        $('#sync-connect').disabled = false;
+        return;
+      }
+
+      setSupabaseConfig({ url, anonKey });
+      const ok = await initCloudSync();
+      closeSheet();
+      if (ok) {
+        toast('✅ Conectado a la nube');
+      } else {
+        toast('⚠️ Conectado pero sync inicial falló');
+      }
+      render();
+    };
+  } else {
+    $('#sync-share-creds').onclick = async () => {
+      const text =
+        `🔗 SINCRONIZACIÓN DEL CLUB ${state.clubName.toUpperCase()}\n\n` +
+        `1. Abrí la app: ${window.location.origin + window.location.pathname}\n` +
+        `2. Iniciá sesión\n` +
+        `3. Andá a Más → Sincronización\n` +
+        `4. Pegá estos datos:\n\n` +
+        `URL:\n${cfg.url}\n\n` +
+        `Anon Key:\n${cfg.anonKey}\n\n` +
+        `5. Tocá "Conectar". Listo, vas a ver los mismos datos.`;
+      try {
+        await navigator.clipboard.writeText(text);
+        toast('📋 Copiado. Pegalo en WhatsApp');
+      } catch {
+        // Open a sheet with the text to copy manually
+        closeSheet();
+        openSheet({
+          title: 'Compartir credenciales',
+          body: `
+            <p style="color:var(--text-dim);font-size:13px;margin:0 0 10px;">Copialo manualmente y mandalo por WhatsApp:</p>
+            <div class="preview-box">${escapeHTML(text)}</div>
+          `,
+        });
+      }
+    };
+    $('#sync-pull').onclick = async () => {
+      toast('Refrescando...');
+      const cloudData = await fetchCloudData();
+      if (cloudData) {
+        isApplyingRemote = true;
+        state = { ...state, ...cloudData };
+        applyDefaults();
+        isApplyingRemote = false;
+        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch {}
+        closeSheet();
+        render();
+        toast('✓ Datos actualizados de la nube');
+      } else {
+        toast('La nube está vacía o no se pudo leer');
+      }
+    };
+    $('#sync-disconnect').onclick = () => {
+      if (!confirm('¿Desconectar la sincronización? Los datos siguen en este celu, pero no se actualizarán con los otros.')) return;
+      disconnectCloudSync();
+      closeSheet();
+      render();
+      toast('Sincronización desconectada');
+    };
+  }
 }
 
 function openCategoryManage() {
@@ -3973,6 +4287,8 @@ async function resetData() {
 (async function init() {
   await loadState();
   render();
+  // Try to sync with cloud (will re-render if cloud data differs)
+  initCloudSync().catch(e => console.warn('Cloud sync init error', e));
 })();
 
 // Expose closeSheet to inline handlers
